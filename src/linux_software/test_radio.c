@@ -54,17 +54,25 @@ void print_benchmark(volatile unsigned int *periph_base)
     // to get an idea of how fast you can generally read from an axi-lite slave device
     unsigned int start_time;
     unsigned int stop_time;
+    unsigned int clock_cycles;
+    unsigned int testcycles = 2048;
+    unsigned int cycletest_bytesize = 4;
+    unsigned int board_clockspeed = 125e6;
+    unsigned int clocks_per_request = 0;
     start_time = *(periph_base+RADIO_TUNER_TIMER_REG_OFFSET);
     for (int i=0;i<2048;i++)
         stop_time = *(periph_base+RADIO_TUNER_TIMER_REG_OFFSET);
-    printf("Elapsed time in clocks = %u\n",stop_time-start_time);
-    float throughput=0; 
+    clock_cycles = stop_time - start_time;
+    clocks_per_request = clock_cycles / testcycles;
+    printf("Elapsed time in clocks = %u\n",clock_cycles);
     // please insert your code here for calculate the actual throughput in Mbytes/second
     // how much data was transferred? How long did it take?
-    unsigned int bytes_transferred = 0; // change obviously
-    float time_spent = 1; // change obviously
-    printf("You transferred %f bytes of data in %f seconds\n",bytes_transferred,time_spent);
+    unsigned int bytes_transferred = cycletest_bytesize * testcycles;
+    float time_spent = (float) clock_cycles / board_clockspeed;
+    float throughput= bytes_transferred / time_spent / 1e6; // Measured in Mbytes 
+    printf("You transferred %u bytes of data in %f seconds\n",bytes_transferred,time_spent);
     printf("Measured Transfer throughput = %f Mbytes/sec\n",throughput);
+    printf("The effective peripheral access time in clocks is %u PL clocks per request\n", clocks_per_request); 
 }
 
 int main()
@@ -73,7 +81,7 @@ int main()
 // first, get a pointer to the peripheral base address using /dev/mem and the function mmap
     volatile unsigned int *my_periph = get_a_pointer(RADIO_PERIPH_ADDRESS);	
 
-    printf("\r\n\r\n\r\nLab 6 YOURNAME - Custom Peripheral Demonstration\n\r");
+    printf("\r\n\r\n\r\nLab 6 Aaron Covrig - Custom Peripheral Demonstration\n\r");
     *(my_periph+RADIO_TUNER_CONTROL_REG_OFFSET) = 0; // make sure radio isn't in reset
     printf("Tuning Radio to 30MHz\n\r");
     radioTuner_tuneRadio(my_periph,30e6);

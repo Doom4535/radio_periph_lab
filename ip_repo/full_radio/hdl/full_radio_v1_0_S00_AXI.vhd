@@ -5,7 +5,7 @@ use ieee.numeric_std.all;
 entity full_radio_v1_0_S00_AXI is
 	generic (
 		-- Users to add parameters here
-
+        IQ_DATA_WIDTH : integer := 16;
 		-- User parameters ends
 		-- Do not modify the parameters beyond this line
 
@@ -119,16 +119,57 @@ architecture arch_imp of full_radio_v1_0_S00_AXI is
 	signal byte_index	: integer;
 	signal aw_en	: std_logic;
 
-COMPONENT dds_compiler_0
-  PORT (
-    aclk : IN STD_LOGIC;
-    aresetn : IN STD_LOGIC;
-    s_axis_phase_tvalid : IN STD_LOGIC;
-    s_axis_phase_tdata : IN STD_LOGIC_VECTOR(31 DOWNTO 0);
-    m_axis_data_tvalid : OUT STD_LOGIC;
-    m_axis_data_tdata : OUT STD_LOGIC_VECTOR(31 DOWNTO 0)
-  );
+    COMPONENT dds_compiler_0
+      PORT (
+        aclk : IN STD_LOGIC;
+        aresetn : IN STD_LOGIC;
+        s_axis_phase_tvalid : IN STD_LOGIC;
+        s_axis_phase_tdata : IN STD_LOGIC_VECTOR(31 DOWNTO 0);
+        m_axis_data_tvalid : OUT STD_LOGIC;
+        m_axis_data_tdata : OUT STD_LOGIC_VECTOR(31 DOWNTO 0)
+      );
     END COMPONENT;
+    
+    COMPONENT fir_compiler_0
+      PORT (
+        aresetn : IN STD_LOGIC;
+        aclk : IN STD_LOGIC;
+        s_axis_data_tvalid : IN STD_LOGIC;
+        s_axis_data_tready : OUT STD_LOGIC;
+        s_axis_data_tdata : IN STD_LOGIC_VECTOR(31 DOWNTO 0);
+        m_axis_data_tvalid : OUT STD_LOGIC;
+        m_axis_data_tdata : OUT STD_LOGIC_VECTOR(63 DOWNTO 0) 
+      );
+    END COMPONENT;
+    
+    COMPONENT fir_compiler_1
+      PORT (
+        aresetn : IN STD_LOGIC;
+        aclk : IN STD_LOGIC;
+        s_axis_data_tvalid : IN STD_LOGIC;
+        s_axis_data_tready : OUT STD_LOGIC;
+        s_axis_data_tdata : IN STD_LOGIC_VECTOR(63 DOWNTO 0);
+        m_axis_data_tvalid : OUT STD_LOGIC;
+        m_axis_data_tdata : OUT STD_LOGIC_VECTOR(31 DOWNTO 0) 
+      );
+    END COMPONENT;
+    
+    signal radio_resetn : std_logic;
+    signal adc_sample_tdata : std_logic_vector(dds_compiler_0.m_axis_data_tdata'LENGTH -1 downto 0);
+    signal tuner_data_tdata : std_logic_vector(dds_compiler_0.m_axis_data_tdata'LENGTH -1 downto 0);
+    signal adc_sample_tvalid : std_logic;
+    signal tuner_data_tvalid : std_logic;
+    signal adc_data : std_logic_vector(IQ_DATA_WIDTH -1 downto 0);
+    --signal mixed_tuner_data : std_logic_vector((adc_sample_tdata'LENGTH + tuner_data_tdata'LENGTH -1) downto 0);
+    signal mixed_tuner_iq : std_logic_vector((IQ_DATA_WIDTH *2) -1 downto 0);
+    signal mixed_tuner_i : std_logic_vector((IQ_DATA_WIDTH *2) -1 downto 0);
+    signal mixed_tuner_q : std_logic_vector((IQ_DATA_WIDTH *2) -1 downto 0);
+    
+    signal fir_stage1_data : STD_LOGIC_VECTOR(63 downto 0);
+    signal fir_stage2_data : STD_LOGIC_VECTOR(31 downto 0);
+    signal fir_stage1_valid : STD_LOGIC;
+    signal fir_stage2_valid : STD_LOGIC;
+
 
 begin
 	-- I/O Connections assignments
@@ -160,7 +201,7 @@ begin
 	        -- expects no outstanding transactions. 
 	           axi_awready <= '1';
 	           aw_en <= '0';
-	        elsif (S_AXI_BREADY = '1' and axi_bvalid = '1') then
+	      elsif (S_AXI_BREADY = '1' and axi_bvalid = '1') then
 	           aw_en <= '1';
 	           axi_awready <= '0';
 	      else
@@ -231,6 +272,9 @@ begin
 	      slv_reg2 <= (others => '0');
 	      slv_reg3 <= (others => '0');
 	    else
+	      -- We are using register3 as an uptime clock counter (no PS write support)
+	      slv_reg3 <= std_logic_vector(unsigned(slv_reg3) +1);
+	      -- PS writable registers
 	      loc_addr := axi_awaddr(ADDR_LSB + OPT_MEM_ADDR_BITS downto ADDR_LSB);
 	      if (slv_reg_wren = '1') then
 	        case loc_addr is
@@ -263,7 +307,8 @@ begin
 	              if ( S_AXI_WSTRB(byte_index) = '1' ) then
 	                -- Respective byte enables are asserted as per write strobes                   
 	                -- slave registor 3
-	                slv_reg3(byte_index*8+7 downto byte_index*8) <= S_AXI_WDATA(byte_index*8+7 downto byte_index*8);
+	                -- This register is a read only uptime clock counter
+	                --slv_reg3(byte_index*8+7 downto byte_index*8) <= S_AXI_WDATA(byte_index*8+7 downto byte_index*8);
 	              end if;
 	            end loop;
 	          when others =>
@@ -367,9 +412,10 @@ begin
 	      when b"00" =>
 	        reg_data_out <= slv_reg0;
 	      when b"01" =>
-	        reg_data_out <= x"DEADBEEF";
+	        reg_data_out <= slv_reg1;
 	      when b"10" =>
 	        reg_data_out <= slv_reg2;
+	        --reg_data_out <= x"DEADBEEF";
 	      when b"11" =>
 	        reg_data_out <= slv_reg3;
 	      when others =>
@@ -397,16 +443,66 @@ begin
 
 
 	-- Add user logic here
+	
+	-- Our ADC, Tuner, and FIR filter reset signal
+	radio_resetn <= '1' when signed(slv_reg2) = 0 else '0';
 
-your_instance_name : dds_compiler_0
-  PORT MAP (
-    aclk => s_axi_aclk,
-    aresetn => '1',
-    s_axis_phase_tvalid => '1',
-    s_axis_phase_tdata => slv_reg0,
-    m_axis_data_tvalid => m_axis_tvalid,
-    m_axis_data_tdata => m_axis_tdata
-  );
+    fake_adc : dds_compiler_0
+      PORT MAP (
+        aclk => s_axi_aclk,
+        --aresetn => '1',
+        aresetn => radio_resetn,
+        s_axis_phase_tvalid => '1',
+        s_axis_phase_tdata => slv_reg0,
+        m_axis_data_tvalid => adc_sample_tvalid,
+        m_axis_data_tdata => adc_sample_tdata
+      );
+  
+    tuner_dds : dds_compiler_0
+      PORT MAP (
+        aclk => s_axi_aclk,
+        --aresetn => '1',
+        aresetn => radio_resetn,
+        s_axis_phase_tvalid => '1',
+        s_axis_phase_tdata => slv_reg1,
+        m_axis_data_tvalid => tuner_data_tvalid,
+        m_axis_data_tdata => tuner_data_tdata
+      );
+  
+    -- Mixer
+    adc_data <= adc_sample_tdata(adc_sample_tdata'LENGTH -1 downto adc_sample_tdata'LENGTH - IQ_DATA_WIDTH);
+    mixed_tuner_i <= std_logic_vector(signed(adc_data) * signed(tuner_data_tdata(IQ_DATA_WIDTH -1 downto 00))); 
+    mixed_tuner_q <= std_logic_vector(signed(adc_data) * signed(tuner_data_tdata((2*IQ_DATA_WIDTH) -1 downto IQ_DATA_WIDTH)));
+    -- Left shift to multiply by 2 to account for sinewave reduced duty cycle
+    mixed_tuner_iq <= (mixed_tuner_i(31) & mixed_tuner_i(29 downto 15)) &
+                        (mixed_tuner_q(31) & mixed_tuner_q(29 downto 15));
+    m_axis_tdata  <= fir_stage2_data;
+    m_axis_tvalid <= fir_stage2_valid;
+    
+    -- Filter
+    stage01_fir : fir_compiler_0
+      PORT MAP (
+        --aresetn => s_axi_aresetn,
+        aresetn => radio_resetn,
+        aclk => s_axi_aclk,
+        s_axis_data_tvalid => adc_sample_tvalid,
+        s_axis_data_tready => open,
+        s_axis_data_tdata => mixed_tuner_iq,
+        m_axis_data_tvalid => fir_stage1_valid,
+        m_axis_data_tdata => fir_stage1_data
+      );
+      
+      stage02_fir : fir_compiler_1
+      PORT MAP (
+        --aresetn => s_axi_aresetn,
+        aresetn => radio_resetn,
+        aclk => s_axi_aclk,
+        s_axis_data_tvalid => fir_stage1_valid,
+        s_axis_data_tready => open,
+        s_axis_data_tdata => fir_stage1_data,
+        m_axis_data_tvalid => fir_stage2_valid,
+        m_axis_data_tdata => fir_stage2_data
+      );
 
 
 	-- User logic ends
