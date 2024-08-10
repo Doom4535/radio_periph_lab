@@ -1,0 +1,10 @@
+# Remember forwards for VM:
+iptables -I FORWARD -o virbr0 -d 192.168.122.13 -j ACCEPT
+iptables -t nat -I PREROUTING -p udp --dport 25344 -j DNAT --to 192.168.122.13:25344
+
+# Test the Connection
+echo -n "hi" >/dev/udp/192.168.122.13/25344
+
+# Also, maybe renice everything
+# This will renice all child threads of a pid (might want to use pgrep followed by this)
+# ls /proc/$PID/task | xargs sudo renice -20

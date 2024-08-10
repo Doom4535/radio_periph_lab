@@ -46,6 +46,17 @@ void play_tune(volatile unsigned int *ptrToRadio, float base_frequency)
 	}
 }
 
+void play_constant(volatile unsigned int *ptrToRadio, float base_frequency)
+{
+	int i;
+	float freqs[1] = {2000};
+	float durations[1] = {20};
+	for (i=0;i<1;i++)
+	{
+		radioTuner_setAdcFreq(ptrToRadio,freqs[i]+base_frequency);
+		usleep((int)(durations[i]*500000));
+	}
+}
 
 void print_benchmark(volatile unsigned int *periph_base)
 {
@@ -88,5 +99,14 @@ int main()
     printf("Playing Tune at near 30MHz\r\n");
     play_tune(my_periph,30e6);
     print_benchmark(my_periph);
+    printf("Playing constant\r\n");
+    play_constant(my_periph,30e6);
+    radioTuner_tuneRadio(my_periph,0);
+    printf("Playing constant\r\n");
+    play_constant(my_periph,30e6);
+    printf("Playing constant\r\n");
+    play_constant(my_periph,0);
+    radioTuner_tuneRadio(my_periph,30e6);
+    printf("Done\r\n");
     return 0;
 }
