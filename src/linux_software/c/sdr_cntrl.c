@@ -52,21 +52,6 @@ volatile unsigned int * get_a_pointer(unsigned int phys_addr)
 	return (radio_base);
 }
 
-void dds_tuner(float freq, volatile unsigned int* dds, unsigned int dds_bitsize, unsigned int dds_clk_rate){
-	float phase_inc = freq * (float) (1 << dds_bitsize) / dds_clk_rate;
-	*(dds) = (int) phase_inc;
-}
-
-void tune_adc(float freq){
-	volatile unsigned int* adc_dds = get_a_pointer(RADIO_PERIPH_ADDRESS) +RADIO_ADC_PINC_OFFSET;
-	dds_tuner(freq, adc_dds, RADIO_TUNER_DDS_BITSIZE, RADIO_SAMPLE_RATE);
-}	
-
-void tune_radio(float freq){
-	volatile unsigned int* tuner_dds = get_a_pointer(RADIO_PERIPH_ADDRESS) +RADIO_TUNER_PINC_OFFSET;
-	dds_tuner(freq, tuner_dds, RADIO_TUNER_DDS_BITSIZE, RADIO_SAMPLE_RATE);
-}	
-
 
 struct iq_buf {
 	bool busy;
@@ -77,12 +62,16 @@ struct iq_buf {
 };
 
 
+int dds_phase_inc(float freq, unsigned int dds_bitsize, unsigned int dds_clk_rate);
+void tune_adc(float freq);
+void tune_radio(float freq);
 struct iq_buf* get_buffer();
 bool block_fill_buffer(unsigned int sample, struct iq_buf* buf);
 void lock_fill_buffer(unsigned int sample);
 void stream_ethernet();
 void initialize_radio();
 void read_radio();
+void execute_buffer();
 void parse_console();
 void draw_screen();
 
@@ -91,8 +80,6 @@ uint16_t iq_frame_idx = 0;
 unsigned int loading_iq_buf = 0;
 struct iq_buf iq_buffer[IQ_BUFFER_COUNT] = {{0}};
 
-enum InputState {Menu = 0, Reading};
-enum MenuState {None = 0, Address, Port, Tuning, ADC};
 struct MachineState {
 	bool initialized;
 	bool redraw_screen;
@@ -110,11 +97,31 @@ struct MachineState {
 	volatile unsigned int *radio_fifo;
 	int network_fd;
 
-	enum InputState input_state;
-	enum MenuState menu_state;
 	char menu_buffer[80]; // We'll allow up to 80 characters in a multi character entry
 };
 struct MachineState machine_state = {0}; 
+
+int dds_phase_inc(float freq, unsigned int dds_bitsize, unsigned int dds_clk_rate){
+	float phase_inc = freq * (float) (1 << dds_bitsize) / dds_clk_rate;
+	//*(dds) = (int) phase_inc;
+	return (int) phase_inc;
+}
+
+void tune_adc(float freq){
+	//volatile unsigned int* adc_dds = get_a_pointer(RADIO_PERIPH_ADDRESS) +RADIO_ADC_PINC_OFFSET;
+	int pinc = dds_phase_inc(freq, RADIO_TUNER_DDS_BITSIZE, RADIO_SAMPLE_RATE);
+	//*(adc_dds) = pinc;
+	machine_state.adc_freq = freq;
+	machine_state.adc_pinc = pinc;
+}	
+
+void tune_radio(float freq){
+	//volatile unsigned int* tuner_dds = get_a_pointer(RADIO_PERIPH_ADDRESS) +RADIO_TUNER_PINC_OFFSET;
+	int pinc = dds_phase_inc(freq, RADIO_TUNER_DDS_BITSIZE, RADIO_SAMPLE_RATE);
+	//*(adc_dds) = pinc;
+	machine_state.tuner_freq = freq;
+	machine_state.tuner_pinc = pinc;
+}	
 
 void run_machine() {
 	if(!machine_state.initialized) initialize_radio();
@@ -159,7 +166,7 @@ void stream_ethernet(void) {
 		if (sendto(machine_state.network_fd, b->buf, sizeof(b->buf), 0, (struct sockaddr*)&machine_state.network_dest, sizeof(machine_state.network_dest)) < 0) {
 			perror("cannot send message");
 			close(machine_state.network_fd);
-			exit -1;
+			exit(-1);
 		} else {
 			b->full = false;
 			b->frame_idx = 0;
@@ -169,24 +176,36 @@ void stream_ethernet(void) {
 	}
 }
 
+int fake_fifo = 0;
+int fake_sample = 0;
 void read_radio() {
 	// maybe update to use the full value of the interrupt register and change when it reports full
 	// Possibly also use a wider fifo to use a single read?
-	//if (my_fake_fifo++ >= IQ_FRAME_SAMPLE_SIZE) {
-	//	my_fake_fifo = 0;
-	volatile unsigned int* my_fifo = get_a_pointer(RADIO_FIFO_ADDRESS);
-	if (my_fifo[RADIO_FIFO_OCCUPANCY_OFFSET /4] >= IQ_FRAME_SAMPLE_SIZE) {
+	if (fake_fifo++ >= IQ_FRAME_SAMPLE_SIZE) {
+		fake_fifo = 0;
+	//volatile unsigned int* my_fifo = get_a_pointer(RADIO_FIFO_ADDRESS);
+	//if (my_fifo[RADIO_FIFO_OCCUPANCY_OFFSET /4] >= IQ_FRAME_SAMPLE_SIZE) {
 		bool buf_full = false;
 		struct iq_buf* buf = NULL;
 		buf = get_buffer(); // We should probably try to do this before?
 		//printf("Weee\r\n");
 		for(int i = 0; i < IQ_FRAME_SAMPLE_SIZE; i++) {
-			//buf_full = block_fill_buffer(my_fake_sample++, buf);
-			buf_full = block_fill_buffer(my_fifo[RADIO_FIFO_READ_OFFSET / 4], buf);
+			buf_full = block_fill_buffer(fake_sample++, buf);
+			//buf_full = block_fill_buffer(my_fifo[RADIO_FIFO_READ_OFFSET / 4], buf);
 			//printf("%x\r\n", my_fake_sample);
 		}
 		if (buf_full) {
-			stream_ethernet();
+			if(machine_state.stream_network){
+				stream_ethernet();
+			}
+			// TODO: Update buffer so we don't have to always empty it
+			else {
+				buf->full = false;
+				buf->frame_idx = 0;
+				buf->idx = 0;
+				bzero(buf, sizeof(*buf));
+				buf->busy = false;
+			}
 		}
 		buf = get_buffer(); // Get a new buffer here
 	}
@@ -198,19 +217,32 @@ void read_radio() {
 
 void initialize_radio(){
 	machine_state.radio_fifo = get_a_pointer(RADIO_FIFO_ADDRESS);
-	machine_state.network_fd = socket(AF_INET,SOCK_DGRAM,0);
-	if(machine_state.network_fd<0){
-		perror("cannot open socket");
-		exit -1;
-	}
+
 	bzero(&machine_state.network_dest,sizeof(machine_state.network_dest));
 	machine_state.network_dest.sin_family = AF_INET;
-	machine_state.network_dest.sin_addr.s_addr = inet_addr(BROADCAST_ADDRESS);
+	inet_pton(AF_INET, BROADCAST_ADDRESS, &machine_state.network_dest.sin_addr.s_addr);
+	//machine_state.network_dest.sin_addr.s_addr = inet_addr(BROADCAST_ADDRESS);
 	machine_state.network_dest.sin_port = htons(BROADCAST_PORT);
-	machine_state.stream_network = true;
 	machine_state.redraw_screen = true;
 
+	system("stty raw"); // set terminal to raw mode for our TUI
+
 	machine_state.initialized = true;
+}
+
+void configure_network(){
+	if (!machine_state.stream_network) {
+		// Create the network connection
+		machine_state.network_fd = socket(AF_INET,SOCK_DGRAM,0);
+		if(machine_state.network_fd<0){
+			perror("cannot open socket");
+			exit(-1);
+		}
+	} else {
+		// Close the network connection
+		close(machine_state.network_fd);
+	}
+	machine_state.stream_network = !machine_state.stream_network;
 }
 
 void draw_screen(){
@@ -219,74 +251,169 @@ void draw_screen(){
 	printf("Welcome to Lab7 by: Aaron Covrig\r\n");
 	printf("Current Status:\r\n");
 	printf("\tEthernet Streaming: %s\r\n", machine_state.stream_network ? "True" : "False");
-	printf("\t\tDestination Address %s:%d\r\n", "TODO", 69);
-	printf("\tADC Frequency: %f, Phase Increment: %x\r\n", 69.0, 0x0);
-	printf("\tTuner Frequency: %f, Phase Increment: %x\r\n", 69.0, 0x0);
+	//printf("\t\tDestination Address %s\r\n", inet_ntop(AF_INET, machine_state.network_dest)); //inet_ntoa is deprecated
+	printf("\t\tDestination Address %s:%i\r\n", inet_ntoa(machine_state.network_dest.sin_addr), ntohs(machine_state.network_dest.sin_port));
+	printf("\tADC Frequency: %f, Phase Increment: %x\r\n", machine_state.adc_freq, machine_state.adc_pinc);
+	printf("\tTuner Frequency: %f, Phase Increment: %x\r\n", machine_state.tuner_freq, machine_state.tuner_pinc);
 	printf("Input Options:\r\n");
 	printf("\tA,a:\tSet ethernet stream address\r\n");
 	printf("\tP,p:\tSet ethernet stream port\r\n");
+	printf("\tN,n:\tToggle network streaming of IQ samples\r\n");
 	printf("\tF,f:\tSet the ADC frequency\r\n");
 	printf("\tT,t:\tSet the Tuner frequency\r\n");
 	printf("\tU:\tIncrement the Tuner frequency by 1000 Hertz\r\n");
 	printf("\tu:\tIncrement the Tuner frequency by 100 Hertz\r\n");
 	printf("\tD:\tDecrement the Tuner frequency by 1000 Hertz\r\n");
 	printf("\td:\tDecrement the Tuner frequency by 100 Hertz\r\n");
+	printf("\tctrl-d\tTerminate the Program\r\n");
+	printf("\r\n");
+	printf("\r\n");
+	printf("Execution:\r\n");
+	printf("\tCommand Buffer: %s\r\n", machine_state.menu_buffer);
+	printf("\tCommand History:\r\n");
+	printf("\t\t%s\r\n", "TODO");
+}
+
+void execute_buffer(){
+	// Maybe update by adding a wrapper around number inputs to handle different bases
+	// Maybe update to allow chaining commands (aka, process substrings)
+	char cmd = machine_state.menu_buffer[0];
+	int cmd_length = strnlen(machine_state.menu_buffer, sizeof(machine_state.menu_buffer));
+	char *eptr = &machine_state.menu_buffer[cmd_length];
+	char *cmd_value = &machine_state.menu_buffer[1];
+	switch(cmd){
+		// Maybe add support ip:port notation
+		case 'A': /* Fall through */
+		case 'a':
+		{
+			inet_pton(AF_INET, cmd_value, &machine_state.network_dest.sin_addr.s_addr);
+			break;
+		}
+		case 'P': /* Fall through */
+		case 'p':
+			int port = (int) strtol(cmd_value, &eptr, 10);
+			machine_state.network_dest.sin_port = htons(port);
+			break;
+		case 'F': /* Fall through */
+		case 'f':
+		{
+			float freq = (float) strtod(cmd_value, &eptr);
+			tune_adc(freq);
+			break;
+		}
+		case 'T': /* Fall through */
+		case 't':
+		{
+			float freq = (float) strtod(cmd_value, &eptr);
+			tune_radio(freq);
+			break;
+		}
+	}
+	bzero(&machine_state.menu_buffer, sizeof(machine_state.menu_buffer)); // Clear the buffer
 }
 
 void parse_console(){
 	// Process user inputs
-	int recv_char = fgetc(stdin);
-	if (recv_char == '\r' || recv_char == '\n') {
-		// do nothing
-	} else {
-		switch(recv_char) {
-			case '+':
-				// Not supported
-				break;
-			case '-':
-				// Not supported
-				break;
-			case 'A': /* Fall through */
-			case 'a':
-				break;
-			case 'P': /* Fall through */
-			case 'p':
-				break;
-			case 'F': /* Fall through */
-			case 'f': 
-			{
-				break;
-			}
-			case 'T': /* Fall through */
-			case 't':
-			{
-				break;
-			}
-			case 'U':
-				break;
-			case 'u':
-				break;
-			case 'D':
-				break;
-			case 'd':
-				break;
-			case 'S': /* Fall through */
-			case 's':
-				break;
-			case 'm':
-				break;
-			case 'Z': /* Fall through */
-			case 'z':
-				break;
-			case 'H': /* Fall through */
-			case 'h':
-				break;
-			default:
-				break;
-		
+	int input_val = fgetc(stdin); // Maybe add EOF and other checks
+	char recv_char = (char) input_val;
+	switch(recv_char) {
+		// Execute non-immediate command
+		case '\r': /* Fall through */
+		case '\n':
+			// Execute buffer
+			execute_buffer();
+			break;
+		// Increment volume (only to audio output)
+		case '+':
+			// Not supported
+			break;
+		// Decrement volume (only to audio output)
+		case '-':
+			// Not supported
+			break;
+		// Set network stream destination address
+		case 'A': /* Fall through */
+		case 'a':
+			strncat(machine_state.menu_buffer, &recv_char, sizeof(recv_char));
+			break;
+		// Set network stream destination port
+		case 'P': /* Fall through */
+		case 'p':
+			strncat(machine_state.menu_buffer, &recv_char, sizeof(recv_char));
+			break;
+		// Toggle network streaming (requires network destination)
+		case 'N': /* Fall through */
+		case 'n':
+			configure_network();
+			break;
+		// Set ADC frequency
+		case 'F': /* Fall through */
+		case 'f': 
+		{
+			strncat(machine_state.menu_buffer, &recv_char, sizeof(recv_char));
+			break;
 		}
-		machine_state.redraw_screen = true;
+		// Tune Radio (Set radio channel frequency)
+		case 'T': /* Fall through */
+		case 't':
+		{
+			strncat(machine_state.menu_buffer, &recv_char, sizeof(recv_char));
+			break;
+		}
+		// Increment
+		case 'U':
+			tune_radio(machine_state.tuner_freq +1000);
+			break;
+		case 'u':
+			tune_radio(machine_state.tuner_freq +100);
+			break;
+		// Decrement
+		case 'D':
+			tune_radio(machine_state.tuner_freq -1000);
+			break;
+		case 'd':
+			tune_radio(machine_state.tuner_freq -100);
+			break;
+		// Maybe
+		case 'S': /* Fall through */
+		case 's':
+			break;
+		// Mute
+		case 'm':
+			break;
+		// Zero/Reset
+		case 'Z': /* Fall through */
+		case 'z':
+			break;
+		// Help menu
+		case 'H': /* Fall through */
+		case 'h':
+			break;
+		// Load numbers
+		case '9': /* Fall through */
+		case '8': /* Fall through */
+		case '7': /* Fall through */
+		case '6': /* Fall through */
+		case '5': /* Fall through */
+		case '4': /* Fall through */
+		case '3': /* Fall through */
+		case '2': /* Fall through */
+		case '1': /* Fall through */
+		case '0': /* Fall through */
+		case '.': /* Fall through */
+		case ',': 
+			strncat(machine_state.menu_buffer, &recv_char, sizeof(recv_char));
+			break;
+		// Exit (CTRL-D)
+		case '\04':
+			system("stty cooked"); // Return to normal shell behavior
+			printf("Goodbye\r\n");
+			exit(0);
+			break;
+		default:
+			break;
 	}
+	machine_state.redraw_screen = true;
 }
 
 struct iq_buf* get_buffer() {
@@ -317,7 +444,7 @@ void lock_fill_buffer(unsigned int sample) {
 	struct iq_buf* buf = get_buffer();
 	if (buf == NULL) {
 		perror("Received NULL pointer buffer");
-		exit -1;
+		exit(-1);
 	}
 	if (buf->idx >= IQ_FRAME_BYTE_SIZE) {
 		buf->full = true;
