@@ -291,9 +291,11 @@ void execute_buffer(){
 		}
 		case 'P': /* Fall through */
 		case 'p':
+		{
 			int port = (int) strtol(cmd_value, &eptr, 10);
 			machine_state.network_dest.sin_port = htons(port);
 			break;
+		}
 		case 'F': /* Fall through */
 		case 'f':
 		{
