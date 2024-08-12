@@ -49,6 +49,7 @@ volatile unsigned int * get_a_pointer(unsigned int phys_addr)
 	int mem_fd = open("/dev/mem", O_RDWR | O_SYNC); 
 	void *map_base = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd, phys_addr); 
 	volatile unsigned int *radio_base = (volatile unsigned int *)map_base; 
+	close(mem_fd);
 	return (radio_base);
 }
 
@@ -74,6 +75,7 @@ void read_radio();
 void execute_buffer();
 void parse_console();
 void draw_screen();
+void configure_network();
 
 
 uint16_t iq_frame_idx = 0;
@@ -94,6 +96,7 @@ struct MachineState {
 	//volume
 	//mute
 	
+	volatile unsigned int* radio_peripheral;
 	volatile unsigned int *radio_fifo;
 	int network_fd;
 
@@ -103,22 +106,21 @@ struct MachineState machine_state = {0};
 
 int dds_phase_inc(float freq, unsigned int dds_bitsize, unsigned int dds_clk_rate){
 	float phase_inc = freq * (float) (1 << dds_bitsize) / dds_clk_rate;
-	//*(dds) = (int) phase_inc;
 	return (int) phase_inc;
 }
 
 void tune_adc(float freq){
-	//volatile unsigned int* adc_dds = get_a_pointer(RADIO_PERIPH_ADDRESS) +RADIO_ADC_PINC_OFFSET;
+	volatile unsigned int* adc_dds = machine_state.radio_peripheral +RADIO_ADC_PINC_OFFSET;
 	int pinc = dds_phase_inc(freq, RADIO_TUNER_DDS_BITSIZE, RADIO_SAMPLE_RATE);
-	//*(adc_dds) = pinc;
+	*(adc_dds) = pinc;
 	machine_state.adc_freq = freq;
 	machine_state.adc_pinc = pinc;
 }	
 
 void tune_radio(float freq){
-	//volatile unsigned int* tuner_dds = get_a_pointer(RADIO_PERIPH_ADDRESS) +RADIO_TUNER_PINC_OFFSET;
+	volatile unsigned int* tuner_dds = machine_state.radio_peripheral +RADIO_TUNER_PINC_OFFSET;
 	int pinc = dds_phase_inc(freq, RADIO_TUNER_DDS_BITSIZE, RADIO_SAMPLE_RATE);
-	//*(adc_dds) = pinc;
+	*(tuner_dds) = pinc;
 	machine_state.tuner_freq = freq;
 	machine_state.tuner_pinc = pinc;
 }	
@@ -127,7 +129,7 @@ void run_machine() {
 	if(!machine_state.initialized) initialize_radio();
 
 	int n = 0;
-	//read_radio();
+	read_radio();
 	if (machine_state.redraw_screen) draw_screen();
 	if (machine_state.stream_network) stream_ethernet();
 	//if (ioctl(stdin, FIONREAD, &n) == 0 && n > 0) parse_console();
@@ -171,6 +173,7 @@ void stream_ethernet(void) {
 			b->full = false;
 			b->frame_idx = 0;
 			b->idx = 0;
+			bzero(b->buf, sizeof(*b->buf));
 			b->busy = false;
 		}
 	}
@@ -181,18 +184,15 @@ int fake_sample = 0;
 void read_radio() {
 	// maybe update to use the full value of the interrupt register and change when it reports full
 	// Possibly also use a wider fifo to use a single read?
-	if (fake_fifo++ >= IQ_FRAME_SAMPLE_SIZE) {
-		fake_fifo = 0;
-	//volatile unsigned int* my_fifo = get_a_pointer(RADIO_FIFO_ADDRESS);
-	//if (my_fifo[RADIO_FIFO_OCCUPANCY_OFFSET /4] >= IQ_FRAME_SAMPLE_SIZE) {
+	//if (fake_fifo++ >= IQ_FRAME_SAMPLE_SIZE) {
+	//	fake_fifo = 0;
+	if (machine_state.radio_fifo[RADIO_FIFO_OCCUPANCY_OFFSET /4] >= IQ_FRAME_SAMPLE_SIZE) {
 		bool buf_full = false;
 		struct iq_buf* buf = NULL;
 		buf = get_buffer(); // We should probably try to do this before?
-		//printf("Weee\r\n");
 		for(int i = 0; i < IQ_FRAME_SAMPLE_SIZE; i++) {
-			buf_full = block_fill_buffer(fake_sample++, buf);
-			//buf_full = block_fill_buffer(my_fifo[RADIO_FIFO_READ_OFFSET / 4], buf);
-			//printf("%x\r\n", my_fake_sample);
+			//buf_full = block_fill_buffer(fake_sample++, buf);
+			buf_full = block_fill_buffer(machine_state.radio_fifo[RADIO_FIFO_READ_OFFSET / 4], buf);
 		}
 		if (buf_full) {
 			if(machine_state.stream_network){
@@ -203,11 +203,10 @@ void read_radio() {
 				buf->full = false;
 				buf->frame_idx = 0;
 				buf->idx = 0;
-				bzero(buf, sizeof(*buf));
+				bzero(buf->buf, sizeof(*buf->buf));
 				buf->busy = false;
 			}
 		}
-		buf = get_buffer(); // Get a new buffer here
 	}
 	//else {
 	//    int fifo_occupancy = my_fifo[RADIO_FIFO_OCCUPANCY_OFFSET /4];
@@ -216,6 +215,7 @@ void read_radio() {
 }
 
 void initialize_radio(){
+	machine_state.radio_peripheral = get_a_pointer(RADIO_PERIPH_ADDRESS) +RADIO_TUNER_PINC_OFFSET;
 	machine_state.radio_fifo = get_a_pointer(RADIO_FIFO_ADDRESS);
 
 	bzero(&machine_state.network_dest,sizeof(machine_state.network_dest));
