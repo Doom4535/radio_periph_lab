@@ -406,6 +406,11 @@ void parse_console(){
 		case ',': 
 			strncat(machine_state.menu_buffer, &recv_char, sizeof(recv_char));
 			break;
+		// Remove an entry from the buffer
+		case '\b':   /* Fall through */
+		case '\x7f':
+			machine_state.menu_buffer[strnlen(machine_state.menu_buffer, sizeof(machine_state.menu_buffer)) -1] = '\0';
+			break;
 		// Exit (CTRL-D)
 		case '\04':
 			system("stty cooked"); // Return to normal shell behavior
