@@ -14,6 +14,8 @@
 #include <string.h>
 #include <fcntl.h>
 #include <stdlib.h>
+//#include <linux/i2c-dev.h>
+//#include <i2c/smbus.h>
 #define _BSD_SOURCE
 
 #define RADIO_ADC_PINC_OFFSET 0
@@ -27,6 +29,11 @@
 #define RADIO_FIFO_READ_OFFSET 0x20
 #define RADIO_FIFO_LENGTH_OFFSET 0x24
 #define RADIO_FIFO_ADDRESS 0x43c10000
+
+// If we add I2C support
+//get offsets from vitis SDK in Lab3
+#define I2C_PERIPH_ADDRESS 0x41600000
+#define SSM2603_ADDR	0b0011010
 
 #define BROADCAST_ADDRESS "192.168.42.43"
 //#define BROADCAST_ADDRESS "192.168.122.13"
@@ -131,7 +138,7 @@ void run_machine() {
 	int n = 0;
 	read_radio();
 	if (machine_state.redraw_screen) draw_screen();
-	if (machine_state.stream_network) stream_ethernet();
+	//if (machine_state.stream_network) stream_ethernet(); // maybe doesn't handle not yet full well
 	//if (ioctl(stdin, FIONREAD, &n) == 0 && n > 0) parse_console();
 	if (ioctl(0, FIONREAD, &n) == 0 && n > 0) parse_console();
 }
@@ -165,6 +172,10 @@ void stream_ethernet(void) {
 	}
 	// Send the frame and clear/reset the buffer
 	if (b != NULL) {
+		//printf("Sending frame #%u", (uint16_t)(b->buf[1] << 8 && b->buf[0] ));
+		//uint16_t tmp;
+		//memcpy(&tmp, &b->buf[0], 2);
+		//printf("Sending frame: %u, index val: %u, global index: %u\r\n", tmp, b->frame_idx, iq_frame_idx);
 		if (sendto(machine_state.network_fd, b->buf, sizeof(b->buf), 0, (struct sockaddr*)&machine_state.network_dest, sizeof(machine_state.network_dest)) < 0) {
 			perror("cannot send message");
 			close(machine_state.network_fd);
@@ -190,6 +201,7 @@ void read_radio() {
 		bool buf_full = false;
 		struct iq_buf* buf = NULL;
 		buf = get_buffer(); // We should probably try to do this before?
+		//printf("Created buffer b->frame_idx: %u, global idx: %u", iq_frame_idx);
 		for(int i = 0; i < IQ_FRAME_SAMPLE_SIZE; i++) {
 			//buf_full = block_fill_buffer(fake_sample++, buf);
 			buf_full = block_fill_buffer(machine_state.radio_fifo[RADIO_FIFO_READ_OFFSET / 4], buf);
@@ -430,6 +442,7 @@ struct iq_buf* get_buffer() {
 		buf->busy = true;
 		// Preallocate the frame index
 		if (buf->frame_idx == 0) {
+			//printf("Global frame index: %i", iq_frame_idx);
 			buf->frame_idx = iq_frame_idx++;
 			memcpy(&buf->buf[0], &buf->frame_idx, sizeof(buf->frame_idx));
 			buf->idx = sizeof(buf->frame_idx);
