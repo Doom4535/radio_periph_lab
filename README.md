@@ -18,3 +18,16 @@ A couple of other notes to smooth things along :
 - I'm not convinced that right clicking on the "Update Hardware Platform" works when you've changed the underlying hardware XSA file.  The safest thing to do here (this is where the script really helps) is to just delete the entire Vitis directory and regenerate it.  To regenerate a Vitis directory (workspace with all the software), you can certainly do it manually as in all the other labs; however I just run the last line of "make_project.bat" from the command prompt
 - Make sure to use a standard command prompt, and not the windows powershell.
 - If you are experiencing long build times (i.e. waiting for an excessive amount of time for impl_1 to complete) this may be that you don't have enough memory to handle the level of parallelism that I asked for in the script.  Edit "impl.tcl" to change the line from "-jobs 7" to "-jobs 3" if you don't have 16GB of memory.  Your computer probably doesn't have enough memory to synthesize 7 things in parallel, and is constantly swapping to disk
+
+# How to deploy (assuming Linux)
+1. Source Vivado into environment, for example: `. /opt/Xilinx/Vivado/2023.2/settings64.sh`
+2. Build the HDL: `./make_project.sh`
+3. Copy the built `design_1_wrapper.bit.bin` file to the `ZyboZ7` board (`cp vivado/radio_periph_lab.runs/impl_1/design_1_wrapper.bit.bin <path_to_your_sd_card>`)
+4. Copy the SDR software to the `ZyboZ7` (`cp src/linux_software/c/sdr_cntrl.c <path_to_your_sd_card>`)
+5. Build the SDR software on the `ZyboZ7` (easier than cross compiling): `gcc -o sdr_cntrl.exe sdr_cntrl.c`
+6. Program the FPGA bitstream:
+```bash
+fpgautil -b config_codec.bit.bin     # Optional, enables audio output on headphone jack
+fpgautil -b design_1_wrapper.bit.bin
+```
+7. Execute the SDR software (and follow TUI instruction prompts): `./sdr_cntrl.exe`
