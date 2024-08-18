@@ -61,22 +61,12 @@ volatile unsigned int * get_a_pointer(unsigned int phys_addr)
 }
 
 
-struct iq_buf {
-	bool busy;
-	bool full;
-	uint16_t frame_idx;
-	unsigned int idx;
-	uint8_t buf[IQ_FRAME_BYTE_SIZE]; // We'll add the frame index first
-};
-
-
 int dds_phase_inc(float freq, unsigned int dds_bitsize, unsigned int dds_clk_rate);
 void tune_adc(float freq);
 void tune_radio(float freq);
-struct iq_buf* get_buffer();
-bool block_fill_buffer(unsigned int sample, struct iq_buf* buf);
-void lock_fill_buffer(unsigned int sample);
-void stream_ethernet();
+int append_sample(uint32_t sample);
+void send_frame(int idx);
+//void stream_ethernet();
 void initialize_radio();
 void read_radio();
 void execute_buffer();
@@ -84,10 +74,10 @@ void parse_console();
 void draw_screen();
 void configure_network();
 
-
-uint16_t iq_frame_idx = 0;
-unsigned int loading_iq_buf = 0;
-struct iq_buf iq_buffer[IQ_BUFFER_COUNT] = {{0}};
+uint16_t frame_counter = 0;
+int frame_idx = 0;
+int frame_byte_idx = 0;
+uint8_t frame_byte_buf[IQ_BUFFER_COUNT * IQ_FRAME_BYTE_SIZE] = {0};
 
 struct MachineState {
 	bool initialized;
@@ -118,7 +108,7 @@ int dds_phase_inc(float freq, unsigned int dds_bitsize, unsigned int dds_clk_rat
 
 void tune_adc(float freq){
 	volatile unsigned int* adc_dds = machine_state.radio_peripheral +RADIO_ADC_PINC_OFFSET;
-	int pinc = dds_phase_inc(freq, RADIO_TUNER_DDS_BITSIZE, RADIO_SAMPLE_RATE);
+	int pinc = dds_phase_inc(freq, RADIO_ADC_DDS_BITSIZE, RADIO_SAMPLE_RATE);
 	*(adc_dds) = pinc;
 	machine_state.adc_freq = freq;
 	machine_state.adc_pinc = pinc;
@@ -154,41 +144,8 @@ int main() {
 	return 0;
 }
 
-void stream_ethernet(void) {
-	struct iq_buf* b = NULL;
-	for (int i = 0; i < IQ_BUFFER_COUNT; i++) {
-		struct iq_buf* gb = &iq_buffer[i];
-		if (gb->full = true && gb->busy == false ){
-			gb->busy = true;
-			if (b == NULL) {
-				b = gb;
-			} 
-			// Sorta handle overflows by only updating if the difference is small
-			else if (gb->frame_idx - b->frame_idx < 5) {
-				b->busy = false;
-				b = gb;
-			}
-		}
-	}
-	// Send the frame and clear/reset the buffer
-	if (b != NULL) {
-		//printf("Sending frame #%u", (uint16_t)(b->buf[1] << 8 && b->buf[0] ));
-		//uint16_t tmp;
-		//memcpy(&tmp, &b->buf[0], 2);
-		//printf("Sending frame: %u, index val: %u, global index: %u\r\n", tmp, b->frame_idx, iq_frame_idx);
-		if (sendto(machine_state.network_fd, b->buf, sizeof(b->buf), 0, (struct sockaddr*)&machine_state.network_dest, sizeof(machine_state.network_dest)) < 0) {
-			perror("cannot send message");
-			close(machine_state.network_fd);
-			exit(-1);
-		} else {
-			b->full = false;
-			b->frame_idx = 0;
-			b->idx = 0;
-			bzero(b->buf, sizeof(*b->buf));
-			b->busy = false;
-		}
-	}
-}
+// We don't currently support detecting full buffers
+//void stream_ethernet(void) {}
 
 int fake_fifo = 0;
 int fake_sample = 0;
@@ -198,36 +155,22 @@ void read_radio() {
 	//if (fake_fifo++ >= IQ_FRAME_SAMPLE_SIZE) {
 	//	fake_fifo = 0;
 	if (machine_state.radio_fifo[RADIO_FIFO_OCCUPANCY_OFFSET /4] >= IQ_FRAME_SAMPLE_SIZE) {
-		bool buf_full = false;
-		struct iq_buf* buf = NULL;
-		buf = get_buffer(); // We should probably try to do this before?
+		int idx = -1;
 		//printf("Created buffer b->frame_idx: %u, global idx: %u", iq_frame_idx);
 		for(int i = 0; i < IQ_FRAME_SAMPLE_SIZE; i++) {
-			//buf_full = block_fill_buffer(fake_sample++, buf);
-			buf_full = block_fill_buffer(machine_state.radio_fifo[RADIO_FIFO_READ_OFFSET / 4], buf);
+			idx = append_sample(machine_state.radio_fifo[RADIO_FIFO_READ_OFFSET / 4]);
+			//status = append_sample(fake_sample++);
 		}
-		if (buf_full) {
+		if (idx >= 0) {
 			if(machine_state.stream_network){
-				stream_ethernet();
-			}
-			// TODO: Update buffer so we don't have to always empty it
-			else {
-				buf->full = false;
-				buf->frame_idx = 0;
-				buf->idx = 0;
-				bzero(buf->buf, sizeof(*buf->buf));
-				buf->busy = false;
+				send_frame(idx);
 			}
 		}
 	}
-	//else {
-	//    int fifo_occupancy = my_fifo[RADIO_FIFO_OCCUPANCY_OFFSET /4];
-	//    printf("I think the buffer occupancy is %x or %d in decimal\r\n", fifo_occupancy, fifo_occupancy);
-	//}
 }
 
 void initialize_radio(){
-	machine_state.radio_peripheral = get_a_pointer(RADIO_PERIPH_ADDRESS) +RADIO_TUNER_PINC_OFFSET;
+	machine_state.radio_peripheral = get_a_pointer(RADIO_PERIPH_ADDRESS);
 	machine_state.radio_fifo = get_a_pointer(RADIO_FIFO_ADDRESS);
 
 	bzero(&machine_state.network_dest,sizeof(machine_state.network_dest));
@@ -435,65 +378,52 @@ void parse_console(){
 	machine_state.redraw_screen = true;
 }
 
-struct iq_buf* get_buffer() {
-	// We can have issues if all buffers are in use/full (aka, make sure to empty them)
-	struct iq_buf* buf = &iq_buffer[loading_iq_buf];
-	if (buf->busy == false && buf->full == false) {
-		buf->busy = true;
-		// Preallocate the frame index
-		if (buf->frame_idx == 0) {
-			//printf("Global frame index: %i", iq_frame_idx);
-			buf->frame_idx = iq_frame_idx++;
-			memcpy(&buf->buf[0], &buf->frame_idx, sizeof(buf->frame_idx));
-			buf->idx = sizeof(buf->frame_idx);
-			//printf("New frame %d\r\n", buf->frame_idx);
+int append_sample(uint32_t sample){
+	// Check if new frame (add frame index if it is)
+	int write_idx = frame_byte_idx + (IQ_FRAME_BYTE_SIZE * frame_idx);
+	if (frame_byte_idx == 0){
+		memcpy(&frame_byte_buf[write_idx], &frame_counter, sizeof(frame_counter));
+		frame_byte_idx +=2;
+	}
+	// Write sample into buffer
+	write_idx = frame_byte_idx + (IQ_FRAME_BYTE_SIZE * frame_idx);
+	memcpy(&frame_byte_buf[write_idx], &sample, sizeof(sample));
+	//uint8_t sample_bytes = *((uint8_t *) &sample + 0);
+	//volatile unsigned int* adc_dds = machine_state.radio_peripheral +RADIO_ADC_PINC_OFFSET;
+	//uint8_t flipped[4] = {0};
+	//uint8_t *sample_bytes = &sample;
+	//memcpy(&flipped[0], sample_bytes +1, 1);
+	//memcpy(&flipped[1], sample_bytes +0, 1);
+	//memcpy(&flipped[2], sample_bytes +3, 1);
+	//memcpy(&flipped[3], sample_bytes +2, 1);
+	//uint32_t flipped_sample = 0;
+	//memcpy(&flipped_sample, &flipped, sizeof(flipped));
+	//memcpy(&frame_byte_buf[write_idx], &flipped_sample, sizeof(flipped_sample));
+	//printf("Sample: %x, Flipped: %x", sample, flipped_sample);
+	frame_byte_idx +=4;
+	// Check if we have finished a frame
+	if (frame_byte_idx >= IQ_FRAME_BYTE_SIZE){
+		frame_byte_idx = 0;
+		int finished_frame_idx = frame_idx++;
+		if (frame_idx >= IQ_BUFFER_COUNT){
+			frame_idx = 0;
 		}
-	} else {
-		loading_iq_buf = (loading_iq_buf +1) % IQ_BUFFER_COUNT;
-		buf = get_buffer();
-		// This was fun, but we should probably go to something that
-		// makes it easier for us to drop data if the buffer is full
-	}	
-	if (buf != NULL) {
-		return buf;
+		//return true
+		return finished_frame_idx;
 	}
-	return NULL;
+	// Default to not finished
+	//return false;
+	return -1;
 }
 
-void lock_fill_buffer(unsigned int sample) {
-	struct iq_buf* buf = get_buffer();
-	if (buf == NULL) {
-		perror("Received NULL pointer buffer");
-		exit(-1);
+void send_frame(int idx) {
+	if (idx >= 0 && machine_state.stream_network) {
+		uint8_t *frame_start_idx = &frame_byte_buf[idx * IQ_FRAME_BYTE_SIZE];
+		//printf("Sending frame: %u, index val: %u\r\n", (uint16_t) frame_start_idx, idx);
+		if (sendto(machine_state.network_fd, frame_start_idx, IQ_FRAME_BYTE_SIZE, 0, (struct sockaddr*)&machine_state.network_dest, sizeof(machine_state.network_dest)) < 0) {
+			perror("cannot send message");
+			close(machine_state.network_fd);
+			exit(-1);
+		}
 	}
-	if (buf->idx >= IQ_FRAME_BYTE_SIZE) {
-		buf->full = true;
-		buf->busy = false;
-		buf = get_buffer();
-	}
-	memcpy(&buf->buf[buf->idx], &sample, sizeof(sample));
-	buf->idx += 4;
-	if (buf->idx >= IQ_FRAME_BYTE_SIZE) {
-		buf->full = true;
-	}
-	buf->busy = false;
-	// Maybe put debug code here to check if buffers are filling
-	// faster than we can send them
-	// We should also profile this, a simple buffer is probably
-	// technically better (but far less exciting)
-}
-
-bool block_fill_buffer(unsigned int sample, struct iq_buf* buf) {
-	memcpy(&buf->buf[buf->idx], &sample, sizeof(sample));
-	buf->idx += 4;
-	if (buf->idx >= IQ_FRAME_BYTE_SIZE) {
-		buf->full = true;
-		buf->busy = false;
-	}
-	// Maybe put debug code here to check if buffers are filling
-	// faster than we can send them
-	// We should also profile this, a simple buffer is probably
-	// technically better (but far less exciting)
-
-	return buf->full;
 }
